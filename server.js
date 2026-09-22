@@ -5,6 +5,15 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
+// Allow our frontend (a different website) to call this backend.
+// Browsers block "cross-site" requests by default for security —
+// this line tells the browser "it's fine, CricRadar's frontend can ask me for data."
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET');
+  next();
+});
+
 // ---- CONFIG ----
 // IMPORTANT: this key should never be pasted into chat again.
 // On the real hosting service, this comes from an "environment variable" —
