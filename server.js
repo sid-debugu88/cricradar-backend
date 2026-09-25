@@ -1,13 +1,13 @@
-// CricRadar backend — the "kitchen" that watches real cricket scores
-// and figures out what's worth alerting Pakistan cricket fans about.
+// Sift backend — the "kitchen" that watches real cricket scores
+// from around the world and pushes real alerts to subscribed devices,
+// even when their browser tab is closed.
 
 const express = require('express');
+const webpush = require('web-push');
 const app = express();
 app.use(express.json());
 
-// Allow our frontend (a different website) to call this backend.
-// Browsers block "cross-site" requests by default for security —
-// this line tells the browser "it's fine, CricRadar's frontend can ask me for data."
+// This line tells the browser "it's fine, Sift's frontend can ask me for data."
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET');
@@ -21,8 +21,42 @@ app.use((req, res, next) => {
 const CRICAPI_KEY = process.env.CRICAPI_KEY || 'PUT_KEY_HERE_LOCALLY_ONLY';
 const POLL_INTERVAL_MS = 30 * 1000; // check every 30 seconds
 
-// Teams/keywords this test build cares about. Later this becomes per-user.
-const WATCHED_TEAMS = ['pakistan'];
+// ---- PUSH NOTIFICATION SETUP ----
+// VAPID keys identify this server to browsers' push services (Chrome's,
+// Firefox's, etc.) so they trust it to send notifications. Generate your
+// own pair once with: npx web-push generate-vapid-keys
+// Then set them as environment variables on Railway — never hardcode them.
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
+
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails('mailto:admin@example.com', VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+  console.log('Push notifications: configured');
+} else {
+  console.log('Push notifications: NOT configured — set VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY');
+}
+
+// Every device that's enabled alerts gets stored here so we can push to
+// them later. In-memory for the MVP — resets if the server restarts,
+// which is fine for testing but a real launch needs a database.
+let subscriptions = [];
+
+// World cricket — international teams, major domestic leagues, and ICC events.
+// A match counts as relevant if it involves one of these teams OR belongs to
+// one of these tournaments. Later this becomes per-user picks.
+const WATCHED_TEAMS = [
+  'india', 'pakistan', 'australia', 'england', 'south africa',
+  'new zealand', 'sri lanka', 'bangladesh', 'afghanistan', 'west indies',
+  'ireland', 'zimbabwe', 'scotland', 'netherlands', 'nepal', 'uae'
+];
+
+const WATCHED_COMPETITIONS = [
+  'ipl', 'indian premier league', 'psl', 'pakistan super league',
+  'big bash', 'bbl', 'the hundred', 'cpl', 'caribbean premier league',
+  'sa20', 'women\'s premier league', 'wpl', 'women\'s big bash',
+  'world cup', 't20 world cup', 'champions trophy', 'world test championship',
+  'the ashes', 'asia cup'
+];
 
 // ---- STATE ----
 // This is our "memory" of what we've already seen, so we don't
@@ -37,13 +71,43 @@ function pushAlert(alert) {
   alertFeed.unshift(alert); // newest first
   alertFeed = alertFeed.slice(0, 50); // keep the last 50 only
   console.log('[ALERT]', alert.headline);
-  // Phase 2 will add: actually push this to people's phones.
-  // For now it just lands in the feed your app reads.
+  sendPushToAll(alert);
+}
+
+// Actually deliver this alert to every subscribed device, even ones
+// with the site closed right now — this is the real "wake your phone up."
+async function sendPushToAll(alert) {
+  if (!VAPID_PUBLIC_KEY || subscriptions.length === 0) return;
+
+  const payload = JSON.stringify({
+    title: alert.tag,
+    body: alert.headline + (alert.sub ? ' — ' + alert.sub : ''),
+  });
+
+  const stillValid = [];
+  for (const sub of subscriptions) {
+    try {
+      await webpush.sendNotification(sub, payload);
+      stillValid.push(sub);
+    } catch (err) {
+      // A 410/404 means the browser unsubscribed or the device is gone —
+      // drop it quietly instead of retrying forever.
+      if (err.statusCode !== 410 && err.statusCode !== 404) {
+        console.error('[push] failed to one subscriber:', err.message);
+        stillValid.push(sub);
+      }
+    }
+  }
+  subscriptions = stillValid;
 }
 
 function involvesWatchedTeam(match) {
   const teams = (match.teams || []).map(t => t.toLowerCase());
-  return WATCHED_TEAMS.some(w => teams.some(t => t.includes(w)));
+  const name = (match.name || '').toLowerCase();
+  const series = (match.series_id || match.matchType || '').toString().toLowerCase();
+  const byTeam = WATCHED_TEAMS.some(w => teams.some(t => t.includes(w)));
+  const byCompetition = WATCHED_COMPETITIONS.some(c => name.includes(c) || series.includes(c));
+  return byTeam || byCompetition;
 }
 
 // The core "brain": compares new match data to what we saw last time
@@ -129,7 +193,22 @@ app.get('/api/feed', (req, res) => {
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, lastPoll: new Date().toISOString(), matchesTracked: Object.keys(lastKnownState).length });
+  res.json({ ok: true, lastPoll: new Date().toISOString(), matchesTracked: Object.keys(lastKnownState).length, subscribers: subscriptions.length });
+});
+
+// The frontend needs this public key to ask the browser for push permission.
+app.get('/api/push/public-key', (req, res) => {
+  res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
+// The frontend calls this once the browser grants permission, handing us
+// the subscription object we'll use to actually push to that device.
+app.post('/api/push/subscribe', (req, res) => {
+  const sub = req.body;
+  if (!sub || !sub.endpoint) return res.status(400).json({ ok: false, error: 'Invalid subscription' });
+  const exists = subscriptions.some(s => s.endpoint === sub.endpoint);
+  if (!exists) subscriptions.push(sub);
+  res.json({ ok: true, subscribers: subscriptions.length });
 });
 
 // ---- START ----
