@@ -1,7 +1,7 @@
 {
-  "name": "cricradar-backend",
+  "name": "sift-backend",
   "version": "1.0.0",
-  "description": "Backend that watches live Pakistan cricket scores and generates alerts",
+  "description": "Backend that watches live world cricket scores and pushes real alerts",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -10,6 +10,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "web-push": "^3.6.7"
   }
 }
