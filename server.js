@@ -19,7 +19,7 @@ app.use((req, res, next) => {
 // On the real hosting service, this comes from an "environment variable" —
 // a setting on the server's dashboard, not typed into the code itself.
 const CRICAPI_KEY = process.env.CRICAPI_KEY || 'PUT_KEY_HERE_LOCALLY_ONLY';
-const POLL_INTERVAL_MS = 30 * 1000; // check every 30 seconds
+const POLL_INTERVAL_MS = 15 * 60 * 1000; // check every 15 minutes — CricAPI's free tier allows only 100 requests/day (~96 at this rate, with headroom)
 
 // ---- PUSH NOTIFICATION SETUP ----
 // VAPID keys identify this server to browsers' push services (Chrome's,
@@ -216,5 +216,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`CricRadar backend running on port ${PORT}`);
   checkForUpdates(); // run once immediately
-  setInterval(checkForUpdates, POLL_INTERVAL_MS); // then every 30s forever
+  setInterval(checkForUpdates, POLL_INTERVAL_MS); // then every 15 minutes forever
 });
