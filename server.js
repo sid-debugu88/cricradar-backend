@@ -24,6 +24,13 @@ const CRICAPI_KEY = process.env.CRICAPI_KEY || 'PUT_KEY_HERE_LOCALLY_ONLY';
 const POLL_INTERVAL_MS = 15 * 60 * 1000; // live scores: every 15 minutes
 const SERIES_POLL_INTERVAL_MS = 4 * 60 * 60 * 1000; // series/fixtures change slowly — every 4 hours is plenty and keeps us inside the 100/day budget
 
+// Highlightly is our second data source — used only for rich match detail
+// (scorecards, fall of wickets, best batsmen/bowlers, venue, predictions)
+// when someone actually clicks a card. Separate free 100-requests/day budget
+// from CricAPI, so neither source runs out because of the other.
+const HIGHLIGHTLY_KEY = process.env.HIGHLIGHTLY_KEY || 'PUT_KEY_HERE_LOCALLY_ONLY';
+const HIGHLIGHTLY_BASE = 'https://cricket.highlightly.net';
+
 // ---- PUSH NOTIFICATION SETUP ----
 // VAPID keys identify this server to browsers' push services (Chrome's,
 // Firefox's, etc.) so they trust it to send notifications. Generate your
@@ -239,15 +246,34 @@ app.get('/api/series', (req, res) => {
 // Real detail for a specific match, fetched on demand when a user clicks a
 // card — we don't pre-fetch this for every match to stay inside the daily
 // request budget, only when someone actually wants to see more.
-app.get('/api/match/:id', async (req, res) => {
+// Highlightly's matchId is different from CricAPI's, so this route accepts
+// team names + a rough date to search rather than requiring a Highlightly id.
+app.get('/api/match-detail', async (req, res) => {
+  const { home, away, date } = req.query;
+  if (!home || !away) return res.status(400).json({ ok: false, error: 'Missing home/away team names' });
+
   try {
-    const url = `https://api.cricapi.com/v1/match_info?apikey=${CRICAPI_KEY}&id=${req.params.id}`;
-    const r = await fetch(url);
-    const data = await r.json();
-    if (data.status !== 'success') return res.status(502).json({ ok: false, error: data.reason || 'Not available' });
-    res.json({ ok: true, match: data.data });
+    // Step 1: find the match by team names (and date, if we have one)
+    const searchParams = new URLSearchParams({ homeTeamName: home, awayTeamName: away });
+    if (date) searchParams.set('date', date);
+    const searchUrl = `${HIGHLIGHTLY_BASE}/matches?${searchParams}`;
+    const searchRes = await fetch(searchUrl, {
+      headers: { 'x-rapidapi-key': HIGHLIGHTLY_KEY }
+    });
+    const searchData = await searchRes.json();
+    const found = (searchData.data || [])[0];
+    if (!found) return res.status(404).json({ ok: false, error: 'Match not found in detail source yet' });
+
+    // Step 2: fetch the full detail for that specific match — this is the
+    // rich payload: scorecards, fall of wickets, best batsmen/bowlers, venue.
+    const detailRes = await fetch(`${HIGHLIGHTLY_BASE}/matches/${found.id}`, {
+      headers: { 'x-rapidapi-key': HIGHLIGHTLY_KEY }
+    });
+    const detailData = await detailRes.json();
+    res.json({ ok: true, match: Array.isArray(detailData) ? detailData[0] : detailData });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    console.error('[match-detail] failed:', err.message);
+    res.status(500).json({ ok: false, error: 'Could not reach detail source' });
   }
 });
 
