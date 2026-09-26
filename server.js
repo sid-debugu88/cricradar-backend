@@ -21,7 +21,8 @@ app.use((req, res, next) => {
 // On the real hosting service, this comes from an "environment variable" —
 // a setting on the server's dashboard, not typed into the code itself.
 const CRICAPI_KEY = process.env.CRICAPI_KEY || 'PUT_KEY_HERE_LOCALLY_ONLY';
-const POLL_INTERVAL_MS = 15 * 60 * 1000; // check every 15 minutes — CricAPI's free tier allows only 100 requests/day (~96 at this rate, with headroom)
+const POLL_INTERVAL_MS = 15 * 60 * 1000; // live scores: every 15 minutes
+const SERIES_POLL_INTERVAL_MS = 4 * 60 * 60 * 1000; // series/fixtures change slowly — every 4 hours is plenty and keeps us inside the 100/day budget
 
 // ---- PUSH NOTIFICATION SETUP ----
 // VAPID keys identify this server to browsers' push services (Chrome's,
@@ -66,6 +67,8 @@ const WATCHED_COMPETITIONS = [
 // a real product would use a database, but this is enough to prove it works.
 let lastKnownState = {}; // matchId -> { score summary we last saw }
 let alertFeed = [];      // the list your frontend will display
+let activeSeries = [];   // ongoing/upcoming series we're tracking — fills "Series watch"
+let upcomingFixtures = []; // scheduled matches not live yet — fills "no live match" gap
 
 function pushAlert(alert) {
   alert.id = Date.now() + '-' + Math.random().toString(36).slice(2, 8);
@@ -161,7 +164,37 @@ function summariseScore(match) {
   return match.score.map(s => `${s.inning || ''}: ${s.r}/${s.w} (${s.o} ov)`).join(' · ');
 }
 
-// ---- THE POLLING LOOP ----
+// ---- SERIES & UPCOMING FIXTURES ----
+// Separate, slower poll — series schedules don't change minute to minute,
+// so checking every 4 hours keeps the "what's coming up" data fresh without
+// burning through the same daily request budget as the live-score poll.
+async function checkSeriesAndFixtures() {
+  try {
+    const seriesUrl = `https://api.cricapi.com/v1/series?apikey=${CRICAPI_KEY}&offset=0`;
+    const res = await fetch(seriesUrl);
+    const data = await res.json();
+
+    if (data.status !== 'success') {
+      console.error('CricAPI series error:', data.status, data.reason || '');
+      return;
+    }
+
+    const allSeries = data.data || [];
+    // Keep only series that plausibly involve a team or competition we watch,
+    // matched by name since the series list doesn't break out team names directly.
+    activeSeries = allSeries.filter(s => {
+      const name = (s.name || '').toLowerCase();
+      return WATCHED_TEAMS.some(w => name.includes(w)) ||
+             WATCHED_COMPETITIONS.some(c => name.includes(c));
+    }).slice(0, 8);
+
+    console.log(`[series] tracked ${activeSeries.length} relevant series of ${allSeries.length} total`);
+  } catch (err) {
+    console.error('[series] failed:', err.message);
+  }
+}
+
+
 async function checkForUpdates() {
   try {
     const url = `https://api.cricapi.com/v1/currentMatches?apikey=${CRICAPI_KEY}&offset=0`;
@@ -195,7 +228,27 @@ app.get('/api/feed', (req, res) => {
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, lastPoll: new Date().toISOString(), matchesTracked: Object.keys(lastKnownState).length, subscribers: subscriptions.length });
+  res.json({ ok: true, lastPoll: new Date().toISOString(), matchesTracked: Object.keys(lastKnownState).length, subscribers: subscriptions.length, seriesTracked: activeSeries.length });
+});
+
+// Powers the "Series watch" card — real ongoing/upcoming series, not invented.
+app.get('/api/series', (req, res) => {
+  res.json({ series: activeSeries });
+});
+
+// Real detail for a specific match, fetched on demand when a user clicks a
+// card — we don't pre-fetch this for every match to stay inside the daily
+// request budget, only when someone actually wants to see more.
+app.get('/api/match/:id', async (req, res) => {
+  try {
+    const url = `https://api.cricapi.com/v1/match_info?apikey=${CRICAPI_KEY}&id=${req.params.id}`;
+    const r = await fetch(url);
+    const data = await r.json();
+    if (data.status !== 'success') return res.status(502).json({ ok: false, error: data.reason || 'Not available' });
+    res.json({ ok: true, match: data.data });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 // The frontend needs this public key to ask the browser for push permission.
@@ -216,7 +269,10 @@ app.post('/api/push/subscribe', (req, res) => {
 // ---- START ----
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`CricRadar backend running on port ${PORT}`);
+  console.log(`Sift backend running on port ${PORT}`);
   checkForUpdates(); // run once immediately
   setInterval(checkForUpdates, POLL_INTERVAL_MS); // then every 15 minutes forever
+
+  checkSeriesAndFixtures(); // run once immediately
+  setInterval(checkSeriesAndFixtures, SERIES_POLL_INTERVAL_MS); // then every 4 hours
 });
