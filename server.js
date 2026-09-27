@@ -202,6 +202,8 @@ async function checkSeriesAndFixtures() {
 }
 
 
+let notifiedUpcoming = {}; // matchId -> true, so we only send the "starts soon" alert once per match
+
 async function checkForUpdates() {
   try {
     const url = `https://api.cricapi.com/v1/currentMatches?apikey=${CRICAPI_KEY}&offset=0`;
@@ -217,6 +219,7 @@ async function checkForUpdates() {
     const relevant = matches.filter(involvesWatchedTeam);
 
     relevant.forEach(detectChanges);
+    relevant.forEach(checkUpcomingReminder);
 
     if (relevant.length === 0) {
       console.log(`[poll] checked ${matches.length} matches, none involve watched teams right now`);
@@ -226,6 +229,31 @@ async function checkForUpdates() {
     // This is exactly the kind of "boring but essential" error handling
     // that keeps a 24/7 bot from silently dying at 2am.
     console.error('[poll] failed:', err.message);
+  }
+}
+
+// CricAPI's currentMatches already includes near-future fixtures, not just
+// live ones — so we don't need a separate schedule endpoint to give advance
+// notice. If a watched match hasn't started and kicks off within 24 hours,
+// send one "coming up" alert, then never repeat it for that match.
+function checkUpcomingReminder(match) {
+  if (match.matchStarted || notifiedUpcoming[match.id]) return;
+  if (!match.dateTimeGMT) return;
+
+  const startTime = new Date(match.dateTimeGMT).getTime();
+  const hoursUntil = (startTime - Date.now()) / (1000 * 60 * 60);
+
+  if (hoursUntil > 0 && hoursUntil <= 24) {
+    notifiedUpcoming[match.id] = true;
+    const localTime = new Date(match.dateTimeGMT).toLocaleString('en-US', {
+      weekday: 'short', hour: 'numeric', minute: '2-digit', timeZoneName: 'short'
+    });
+    pushAlert({
+      tag: 'Upcoming',
+      headline: match.name || 'Match coming up',
+      sub: `Starts ${localTime}${match.venue ? ' · ' + match.venue : ''}`,
+      matchId: match.id,
+    });
   }
 }
 
