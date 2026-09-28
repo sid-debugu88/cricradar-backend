@@ -74,6 +74,7 @@ const WATCHED_COMPETITIONS = [
 // a real product would use a database, but this is enough to prove it works.
 let lastKnownState = {}; // matchId -> { score summary we last saw }
 let alertFeed = [];      // the list your frontend will display
+let currentMatchesCache = []; // relevant matches from the latest poll, served to the frontend for free
 let activeSeries = [];   // ongoing/upcoming series we're tracking — fills "Series watch"
 let upcomingFixtures = []; // scheduled matches not live yet — fills "no live match" gap
 
@@ -236,6 +237,12 @@ async function checkForUpdates() {
 
     const matches = data.data || [];
     const relevant = matches.filter(involvesWatchedTeam);
+    // Keep a lightweight copy for the frontend. Costs no extra API hits.
+    currentMatchesCache = relevant.map(m => ({
+      id: m.id, name: m.name, status: m.status, venue: m.venue,
+      date: m.date, dateTimeGMT: m.dateTimeGMT, matchType: m.matchType,
+      teams: m.teams, score: m.score || [], matchStarted: !!m.matchStarted, matchEnded: !!m.matchEnded,
+    }));
 
     relevant.forEach(detectChanges);
     relevant.forEach(checkUpcomingReminder);
@@ -283,6 +290,12 @@ app.get('/api/feed', (req, res) => {
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, lastPoll: new Date().toISOString(), matchesTracked: Object.keys(lastKnownState).length, subscribers: subscriptions.length, seriesTracked: activeSeries.length });
+});
+
+// Raw current matches from the latest poll, so the frontend can render live
+// scores and upcoming fixtures without spending any extra API hits.
+app.get('/api/matches', (req, res) => {
+  res.json({ matches: currentMatchesCache });
 });
 
 // Powers the "Series watch" card — real ongoing/upcoming series, not invented.
