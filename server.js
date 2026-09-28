@@ -21,7 +21,7 @@ app.use((req, res, next) => {
 // On the real hosting service, this comes from an "environment variable" —
 // a setting on the server's dashboard, not typed into the code itself.
 const CRICAPI_KEY = process.env.CRICAPI_KEY || 'PUT_KEY_HERE_LOCALLY_ONLY';
-const POLL_INTERVAL_MS = 15 * 60 * 1000; // live scores: every 15 minutes
+const POLL_INTERVAL_MS = 20 * 60 * 1000; // live scores: every 20 minutes = 72 hits/day, leaving headroom under the 100/day cap for series polling and redeploys
 const SERIES_POLL_INTERVAL_MS = 4 * 60 * 60 * 1000; // series/fixtures change slowly — every 4 hours is plenty and keeps us inside the 100/day budget
 
 // Highlightly is our second data source — used only for rich match detail
@@ -135,10 +135,12 @@ function detectChanges(match) {
 
   if (!prev) {
     // First time we've seen this match — announce it started, don't spam history.
+    summary.wickets = totalWickets(match);
+    summary.innings = (match.score || []).length;
     lastKnownState[id] = summary;
     pushAlert({
       tag: 'Match live',
-      headline: `${match.name || 'Pakistan match'} is live`,
+      headline: `${match.name || 'Match'} is live`,
       sub: match.status || 'In progress',
       matchId: id,
     });
@@ -149,21 +151,38 @@ function detectChanges(match) {
     // Status changed — e.g. "Live" -> "Pakistan won by 6 wickets"
     pushAlert({
       tag: /won|beat/i.test(summary.status) ? 'Result' : 'Update',
-      headline: match.name || 'Pakistan match update',
+      headline: match.name || 'Match update',
       sub: match.status,
       matchId: id,
     });
   } else if (prev.score !== summary.score) {
-    // Score changed but match still going — wicket, milestone, etc.
-    pushAlert({
-      tag: 'Score update',
-      headline: match.name || 'Pakistan match',
-      sub: summariseScore(match),
-      matchId: id,
-    });
+    // Score changed. A live ODI changes every ball, so alerting on every
+    // change would be notification hell. Only alert when a wicket falls
+    // or the innings changes; otherwise quietly update the stored state.
+    const wicketsBefore = prev.wickets || 0;
+    const wicketsNow = totalWickets(match);
+    const inningsBefore = prev.innings || 0;
+    const inningsNow = (match.score || []).length;
+
+    if (wicketsNow > wicketsBefore || inningsNow > inningsBefore) {
+      pushAlert({
+        tag: wicketsNow > wicketsBefore ? 'Wicket' : 'Innings break',
+        headline: match.name || 'Match',
+        sub: summariseScore(match),
+        matchId: id,
+      });
+    }
   }
 
+  summary.wickets = totalWickets(match);
+  summary.innings = (match.score || []).length;
   lastKnownState[id] = summary;
+}
+
+function totalWickets(match) {
+  const scores = match.score || [];
+  if (!scores.length) return 0;
+  return scores[scores.length - 1].w || 0; // wickets in the innings currently in progress
 }
 
 function summariseScore(match) {
@@ -305,6 +324,29 @@ app.get('/api/match-detail', async (req, res) => {
   }
 });
 
+// Sends a test notification to every subscribed device right now, so we can
+// check that push delivery works without waiting for a real match event.
+// Returns exactly what happened for each device so failures are visible.
+app.get('/api/push/test', async (req, res) => {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+    return res.json({ ok: false, problem: 'VAPID keys are not loaded on the server' });
+  }
+  if (subscriptions.length === 0) {
+    return res.json({ ok: false, problem: 'No devices subscribed on the backend (subscribers = 0)' });
+  }
+  const payload = JSON.stringify({ title: 'Sift test', body: 'If you can see this, push notifications work.' });
+  const results = [];
+  for (const sub of subscriptions) {
+    try {
+      await webpush.sendNotification(sub, payload);
+      results.push({ endpoint: sub.endpoint.slice(0, 60) + '...', sent: true });
+    } catch (err) {
+      results.push({ endpoint: sub.endpoint.slice(0, 60) + '...', sent: false, statusCode: err.statusCode, error: err.body || err.message });
+    }
+  }
+  res.json({ ok: true, results });
+});
+
 // The frontend needs this public key to ask the browser for push permission.
 app.get('/api/push/public-key', (req, res) => {
   res.json({ publicKey: VAPID_PUBLIC_KEY });
@@ -327,6 +369,8 @@ app.listen(PORT, () => {
   checkForUpdates(); // run once immediately
   setInterval(checkForUpdates, POLL_INTERVAL_MS); // then every 15 minutes forever
 
-  checkSeriesAndFixtures(); // run once immediately
-  setInterval(checkSeriesAndFixtures, SERIES_POLL_INTERVAL_MS); // then every 4 hours
+  // Series data changes slowly, so don't spend a hit on every redeploy;
+  // first check happens after 1 minute, then every 4 hours.
+  setTimeout(checkSeriesAndFixtures, 60 * 1000);
+  setInterval(checkSeriesAndFixtures, SERIES_POLL_INTERVAL_MS);
 });
