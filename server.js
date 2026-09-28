@@ -78,6 +78,107 @@ let currentMatchesCache = []; // relevant matches from the latest poll, served t
 let activeSeries = [];   // ongoing/upcoming series we're tracking — fills "Series watch"
 let upcomingFixtures = []; // scheduled matches not live yet — fills "no live match" gap
 
+// ---------- ALERT WORDING ----------
+// One place that decides how every alert reads, so notifications feel like one
+// designed product instead of raw data. Rule: what happened -> the number that
+// matters -> one line of context. Anything the data doesn't give us is skipped
+// cleanly rather than guessed.
+
+const TEAM_CODES = {
+  'india': 'IND', 'pakistan': 'PAK', 'australia': 'AUS', 'england': 'ENG',
+  'south africa': 'SA', 'new zealand': 'NZ', 'sri lanka': 'SL', 'bangladesh': 'BAN',
+  'afghanistan': 'AFG', 'west indies': 'WI', 'ireland': 'IRE', 'zimbabwe': 'ZIM',
+  'scotland': 'SCO', 'netherlands': 'NED', 'nepal': 'NEP', 'uae': 'UAE',
+  'united arab emirates': 'UAE', 'usa': 'USA', 'oman': 'OMA', 'canada': 'CAN',
+};
+
+function teamCode(name) {
+  const n = String(name || '').trim();
+  const key = n.toLowerCase().replace(/\s+(women|w|u19|a)$/i, '').trim();
+  const suffix = /\bwomen\b|\s+w$/i.test(n) ? ' W' : '';
+  if (TEAM_CODES[key]) return TEAM_CODES[key] + suffix;
+  // Unknown team: first 3 letters, uppercase, so we never show a giant name
+  return n.replace(/[^A-Za-z]/g, '').slice(0, 3).toUpperCase() || '?';
+}
+
+function matchLabel(match) {
+  const t = match && match.teams;
+  if (Array.isArray(t) && t.length === 2) return `${teamCode(t[0])} v ${teamCode(t[1])}`;
+  // Fall back to the part of the name before the first comma
+  return String((match && match.name) || 'Match').split(',')[0].slice(0, 30);
+}
+
+function formatOvers(o) {
+  return o == null ? '' : ` (${o})`;
+}
+
+// Score of the innings currently in progress, e.g. "WI 24/1 (3.2)"
+function currentScoreText(match) {
+  const sc = (match.score || []);
+  if (!sc.length) return '';
+  const cur = sc[sc.length - 1];
+  const team = teamCode(String(cur.inning || '').replace(/ Inning.*/i, ''));
+  return `${team} ${cur.r}/${cur.w}${formatOvers(cur.o)}`;
+}
+
+// If a second innings is under way we can say what the chase needs.
+function chaseText(match) {
+  const sc = (match.score || []);
+  if (sc.length < 2) return '';
+  const target = sc[0].r + 1;
+  const cur = sc[sc.length - 1];
+  const need = target - cur.r;
+  if (need <= 0) return '';
+  return `Chasing ${target} · needs ${need}`;
+}
+
+function isBigWin(status) { return /won by/i.test(status || ''); }
+
+// Returns { title, body, tag }. `kind` is one of: live, wicket, innings, result, upcoming, update
+function formatAlert(kind, match, extra) {
+  const label = matchLabel(match);
+  const score = currentScoreText(match);
+  const chase = chaseText(match);
+  extra = extra || {};
+
+  switch (kind) {
+    case 'live':
+      return {
+        title: `🔴 LIVE · ${label}`,
+        body: [match.status || 'Play is under way', match.venue ? match.venue.split(',')[0] : ''].filter(Boolean).join(' · '),
+      };
+    case 'wicket':
+      return {
+        title: `WICKET · ${label}`,
+        body: [score, chase].filter(Boolean).join('\n') || 'A wicket has fallen',
+      };
+    case 'innings':
+      return {
+        title: `INNINGS BREAK · ${label}`,
+        body: [score, chase].filter(Boolean).join('\n') || 'The innings has ended',
+      };
+    case 'result':
+      return {
+        title: `${isBigWin(match.status) ? '🏆 ' : ''}RESULT · ${label}`,
+        body: match.status || 'The match has finished',
+      };
+    case 'upcoming':
+      return {
+        title: `STARTS ${extra.when ? extra.when.toUpperCase() : 'SOON'} · ${label}`,
+        body: [match.venue ? match.venue.split(',')[0] : '', match.matchType ? String(match.matchType).toUpperCase() : ''].filter(Boolean).join(' · ') || 'Match coming up',
+      };
+    default:
+      return { title: label, body: match.status || 'Update' };
+  }
+}
+
+function parseGMT(str) {
+  if (!str) return null;
+  const withZ = /Z$|[+-]\d\d:?\d\d$/.test(str) ? str : str + 'Z';
+  const d = new Date(withZ);
+  return isNaN(d.getTime()) ? null : d;
+}
+
 function pushAlert(alert) {
   alert.id = Date.now() + '-' + Math.random().toString(36).slice(2, 8);
   alert.time = new Date().toISOString();
@@ -93,8 +194,9 @@ async function sendPushToAll(alert) {
   if (!VAPID_PUBLIC_KEY || subscriptions.length === 0) return;
 
   const payload = JSON.stringify({
-    title: alert.tag,
-    body: alert.headline + (alert.sub ? ' — ' + alert.sub : ''),
+    title: alert.pushTitle || alert.tag,
+    body: alert.pushBody || (alert.headline + (alert.sub ? ' — ' + alert.sub : '')),
+    matchId: alert.matchId,
   });
 
   const stillValid = [];
@@ -139,22 +241,27 @@ function detectChanges(match) {
     summary.wickets = totalWickets(match);
     summary.innings = (match.score || []).length;
     lastKnownState[id] = summary;
+    const f = formatAlert(match.matchStarted === false ? 'update' : 'live', match);
     pushAlert({
       tag: 'Match live',
       headline: `${match.name || 'Match'} is live`,
       sub: match.status || 'In progress',
       matchId: id,
+      pushTitle: f.title, pushBody: f.body,
     });
     return;
   }
 
   if (prev.status !== summary.status) {
     // Status changed — e.g. "Live" -> "Pakistan won by 6 wickets"
+    const isResult = /won|beat|drawn|tied|no result/i.test(summary.status);
+    const f = formatAlert(isResult ? 'result' : 'update', match);
     pushAlert({
-      tag: /won|beat/i.test(summary.status) ? 'Result' : 'Update',
+      tag: isResult ? 'Result' : 'Update',
       headline: match.name || 'Match update',
       sub: match.status,
       matchId: id,
+      pushTitle: f.title, pushBody: f.body,
     });
   } else if (prev.score !== summary.score) {
     // Score changed. A live ODI changes every ball, so alerting on every
@@ -166,11 +273,14 @@ function detectChanges(match) {
     const inningsNow = (match.score || []).length;
 
     if (wicketsNow > wicketsBefore || inningsNow > inningsBefore) {
+      const isWicket = wicketsNow > wicketsBefore;
+      const f = formatAlert(isWicket ? 'wicket' : 'innings', match);
       pushAlert({
-        tag: wicketsNow > wicketsBefore ? 'Wicket' : 'Innings break',
+        tag: isWicket ? 'Wicket' : 'Innings break',
         headline: match.name || 'Match',
         sub: summariseScore(match),
         matchId: id,
+        pushTitle: f.title, pushBody: f.body,
       });
     }
   }
@@ -264,21 +374,23 @@ async function checkForUpdates() {
 // send one "coming up" alert, then never repeat it for that match.
 function checkUpcomingReminder(match) {
   if (match.matchStarted || notifiedUpcoming[match.id]) return;
-  if (!match.dateTimeGMT) return;
+  const start = parseGMT(match.dateTimeGMT);
+  if (!start) return;
 
-  const startTime = new Date(match.dateTimeGMT).getTime();
-  const hoursUntil = (startTime - Date.now()) / (1000 * 60 * 60);
+  const hoursUntil = (start.getTime() - Date.now()) / (1000 * 60 * 60);
 
   if (hoursUntil > 0 && hoursUntil <= 24) {
     notifiedUpcoming[match.id] = true;
-    const localTime = new Date(match.dateTimeGMT).toLocaleString('en-US', {
-      weekday: 'short', hour: 'numeric', minute: '2-digit', timeZoneName: 'short'
-    });
+    // Human-friendly: "in 3h" when close, otherwise the day, e.g. "tomorrow"
+    const when = hoursUntil < 6 ? `in ${Math.max(1, Math.round(hoursUntil))}h` : (hoursUntil < 24 ? 'tomorrow' : 'soon');
+    const f = formatAlert('upcoming', match, { when });
+    const localTime = start.toUTCString().replace(' GMT', ' GMT');
     pushAlert({
       tag: 'Upcoming',
       headline: match.name || 'Match coming up',
       sub: `Starts ${localTime}${match.venue ? ' · ' + match.venue : ''}`,
       matchId: match.id,
+      pushTitle: f.title, pushBody: f.body,
     });
   }
 }
@@ -347,7 +459,22 @@ app.get('/api/push/test', async (req, res) => {
   if (subscriptions.length === 0) {
     return res.json({ ok: false, problem: 'No devices subscribed on the backend (subscribers = 0)' });
   }
-  const payload = JSON.stringify({ title: 'Sift test', body: 'If you can see this, push notifications work.' });
+
+  // ?kind=wicket|live|result|upcoming|innings sends a realistic sample of that
+  // alert so you can judge the wording and look without waiting for a real match.
+  const sample = {
+    name: 'India vs West Indies, 1st ODI', status: 'India won by 6 wickets', matchType: 'odi',
+    venue: 'Narendra Modi Stadium, Ahmedabad', teams: ['India', 'West Indies'],
+    score: [{ r: 286, w: 9, o: 50, inning: 'West Indies Inning 1' }, { r: 41, w: 2, o: 6.1, inning: 'India Inning 1' }],
+  };
+  const kind = ['live', 'wicket', 'innings', 'result', 'upcoming'].includes(req.query.kind) ? req.query.kind : 'wicket';
+  if (kind === 'result') sample.score[1] = { r: 289, w: 4, o: 44.2, inning: 'India Inning 1' };
+  if (kind === 'innings') sample.score = [sample.score[0]];
+  if (kind === 'live') { sample.status = 'India opt to bowl'; sample.score = []; }
+  if (kind === 'upcoming') { sample.status = 'Match not started'; sample.score = []; }
+  const f = formatAlert(kind, sample, { when: 'tomorrow' });
+  const payload = JSON.stringify({ title: f.title, body: f.body, matchId: 'sample-' + kind });
+
   const results = [];
   for (const sub of subscriptions) {
     try {
@@ -357,7 +484,7 @@ app.get('/api/push/test', async (req, res) => {
       results.push({ endpoint: sub.endpoint.slice(0, 60) + '...', sent: false, statusCode: err.statusCode, error: err.body || err.message });
     }
   }
-  res.json({ ok: true, results });
+  res.json({ ok: true, kind, preview: f, results });
 });
 
 // The frontend needs this public key to ask the browser for push permission.
