@@ -137,6 +137,9 @@ function isBigWin(status) { return /won by/i.test(status || ''); }
 // Returns { title, body, tag }. `kind` is one of: live, wicket, innings, result, upcoming, update
 function formatAlert(kind, match, extra) {
   const label = matchLabel(match);
+  const teamsArr = Array.isArray(match && match.teams) && match.teams.length === 2 ? match.teams : null;
+  const home = teamsArr ? teamCode(teamsArr[0]) : '';
+  const away = teamsArr ? teamCode(teamsArr[1]) : '';
   const score = currentScoreText(match);
   const chase = chaseText(match);
   extra = extra || {};
@@ -146,29 +149,34 @@ function formatAlert(kind, match, extra) {
       return {
         title: `🔴 LIVE · ${label}`,
         body: [match.status || 'Play is under way', match.venue ? match.venue.split(',')[0] : ''].filter(Boolean).join(' · '),
+        home, away,
       };
     case 'wicket':
       return {
         title: `WICKET · ${label}`,
         body: [score, chase].filter(Boolean).join('\n') || 'A wicket has fallen',
+        home, away,
       };
     case 'innings':
       return {
         title: `INNINGS BREAK · ${label}`,
         body: [score, chase].filter(Boolean).join('\n') || 'The innings has ended',
+        home, away,
       };
     case 'result':
       return {
         title: `${isBigWin(match.status) ? '🏆 ' : ''}RESULT · ${label}`,
         body: match.status || 'The match has finished',
+        home, away,
       };
     case 'upcoming':
       return {
         title: `STARTS ${extra.when ? extra.when.toUpperCase() : 'SOON'} · ${label}`,
         body: [match.venue ? match.venue.split(',')[0] : '', match.matchType ? String(match.matchType).toUpperCase() : ''].filter(Boolean).join(' · ') || 'Match coming up',
+        home, away,
       };
     default:
-      return { title: label, body: match.status || 'Update' };
+      return { title: label, body: match.status || 'Update', home, away };
   }
 }
 
@@ -197,6 +205,7 @@ async function sendPushToAll(alert) {
     title: alert.pushTitle || alert.tag,
     body: alert.pushBody || (alert.headline + (alert.sub ? ' — ' + alert.sub : '')),
     matchId: alert.matchId,
+    home: alert.pushHome, away: alert.pushAway,
   });
 
   const stillValid = [];
@@ -247,7 +256,7 @@ function detectChanges(match) {
       headline: `${match.name || 'Match'} is live`,
       sub: match.status || 'In progress',
       matchId: id,
-      pushTitle: f.title, pushBody: f.body,
+      pushTitle: f.title, pushBody: f.body, pushHome: f.home, pushAway: f.away,
     });
     return;
   }
@@ -261,7 +270,7 @@ function detectChanges(match) {
       headline: match.name || 'Match update',
       sub: match.status,
       matchId: id,
-      pushTitle: f.title, pushBody: f.body,
+      pushTitle: f.title, pushBody: f.body, pushHome: f.home, pushAway: f.away,
     });
   } else if (prev.score !== summary.score) {
     // Score changed. A live ODI changes every ball, so alerting on every
@@ -280,7 +289,7 @@ function detectChanges(match) {
         headline: match.name || 'Match',
         sub: summariseScore(match),
         matchId: id,
-        pushTitle: f.title, pushBody: f.body,
+        pushTitle: f.title, pushBody: f.body, pushHome: f.home, pushAway: f.away,
       });
     }
   }
@@ -390,7 +399,7 @@ function checkUpcomingReminder(match) {
       headline: match.name || 'Match coming up',
       sub: `Starts ${localTime}${match.venue ? ' · ' + match.venue : ''}`,
       matchId: match.id,
-      pushTitle: f.title, pushBody: f.body,
+      pushTitle: f.title, pushBody: f.body, pushHome: f.home, pushAway: f.away,
     });
   }
 }
@@ -473,7 +482,7 @@ app.get('/api/push/test', async (req, res) => {
   if (kind === 'live') { sample.status = 'India opt to bowl'; sample.score = []; }
   if (kind === 'upcoming') { sample.status = 'Match not started'; sample.score = []; }
   const f = formatAlert(kind, sample, { when: 'tomorrow' });
-  const payload = JSON.stringify({ title: f.title, body: f.body, matchId: 'sample-' + kind });
+  const payload = JSON.stringify({ title: f.title, body: f.body, matchId: 'sample-' + kind, home: f.home, away: f.away });
 
   const results = [];
   for (const sub of subscriptions) {
