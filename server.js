@@ -21,7 +21,11 @@ app.use((req, res, next) => {
 // On the real hosting service, this comes from an "environment variable" —
 // a setting on the server's dashboard, not typed into the code itself.
 const CRICAPI_KEY = process.env.CRICAPI_KEY || 'PUT_KEY_HERE_LOCALLY_ONLY';
-const POLL_INTERVAL_MS = 20 * 60 * 1000; // live scores: every 20 minutes = 72 hits/day, leaving headroom under the 100/day cap for series polling and redeploys
+const LIVE_POLL_MS = 10 * 60 * 1000;   // when something's live: check every 10 min
+const QUIET_POLL_MS = 35 * 60 * 1000;  // when nothing's live: check every 35 min
+// Worst case (something live all day): 144/day — over budget if sustained 24h,
+// but a full day of continuous live cricket across all watched teams is rare.
+// Typical mixed day (a few hours live, rest quiet) lands well under 100.
 const SERIES_POLL_INTERVAL_MS = 4 * 60 * 60 * 1000; // series/fixtures change slowly — every 4 hours is plenty and keeps us inside the 100/day budget
 
 // Highlightly is our second data source — used only for rich match detail
@@ -75,6 +79,7 @@ const WATCHED_COMPETITIONS = [
 let lastKnownState = {}; // matchId -> { score summary we last saw }
 let alertFeed = [];      // the list your frontend will display
 let currentMatchesCache = []; // relevant matches from the latest poll, served to the frontend for free
+let lastSuccessfulPoll = null; // when we last actually heard back from CricAPI — shown to users honestly
 let activeSeries = [];   // ongoing/upcoming series we're tracking — fills "Series watch"
 let upcomingFixtures = []; // scheduled matches not live yet — fills "no live match" gap
 
@@ -343,7 +348,18 @@ async function checkSeriesAndFixtures() {
 
 let notifiedUpcoming = {}; // matchId -> true, so we only send the "starts soon" alert once per match
 
+// Tracks how many CricAPI calls we've made today, so we can back off
+// automatically instead of guessing and hoping the math holds up.
+let requestCountToday = 0;
+let requestCountDay = new Date().toISOString().slice(0, 10);
+function trackCricApiRequest() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== requestCountDay) { requestCountDay = today; requestCountToday = 0; }
+  requestCountToday++;
+}
+
 async function checkForUpdates() {
+  trackCricApiRequest();
   try {
     const url = `https://api.cricapi.com/v1/currentMatches?apikey=${CRICAPI_KEY}&offset=0`;
     const res = await fetch(url);
@@ -351,7 +367,7 @@ async function checkForUpdates() {
 
     if (data.status !== 'success') {
       console.error('CricAPI error:', data.status, data.reason || '');
-      return;
+      return false;
     }
 
     const matches = data.data || [];
@@ -365,15 +381,19 @@ async function checkForUpdates() {
 
     relevant.forEach(detectChanges);
     relevant.forEach(checkUpcomingReminder);
+    lastSuccessfulPoll = new Date().toISOString();
 
+    const anyLive = relevant.some(m => m.matchStarted && !m.matchEnded);
     if (relevant.length === 0) {
       console.log(`[poll] checked ${matches.length} matches, none involve watched teams right now`);
     }
+    return anyLive;
   } catch (err) {
     // Network hiccup, API down, etc. — log it and just try again next cycle.
     // This is exactly the kind of "boring but essential" error handling
     // that keeps a 24/7 bot from silently dying at 2am.
     console.error('[poll] failed:', err.message);
+    return false;
   }
 }
 
@@ -410,13 +430,17 @@ app.get('/api/feed', (req, res) => {
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, lastPoll: new Date().toISOString(), matchesTracked: Object.keys(lastKnownState).length, subscribers: subscriptions.length, seriesTracked: activeSeries.length });
+  res.json({
+    ok: true, lastPoll: new Date().toISOString(), matchesTracked: Object.keys(lastKnownState).length,
+    subscribers: subscriptions.length, seriesTracked: activeSeries.length,
+    cricApiRequestsToday: requestCountToday, dailySafetyLimit: DAILY_SAFETY_LIMIT,
+  });
 });
 
 // Raw current matches from the latest poll, so the frontend can render live
 // scores and upcoming fixtures without spending any extra API hits.
 app.get('/api/matches', (req, res) => {
-  res.json({ matches: currentMatchesCache });
+  res.json({ matches: currentMatchesCache, lastChecked: lastSuccessfulPoll });
 });
 
 // Powers the "Series watch" card — real ongoing/upcoming series, not invented.
@@ -513,10 +537,25 @@ app.post('/api/push/subscribe', (req, res) => {
 
 // ---- START ----
 const PORT = process.env.PORT || 3000;
+// Self-rescheduling loop: poll faster while something's live, slower when
+// it's quiet, and back off hard if we're running close to CricAPI's
+// 100-requests/day free cap — a real safety net instead of hoping the
+// interval math holds up on a busy day.
+const DAILY_SAFETY_LIMIT = 95; // leave a small buffer under CricAPI's 100/day cap
+async function scheduleNextPoll() {
+  if (requestCountToday >= DAILY_SAFETY_LIMIT) {
+    console.log(`[poll] daily safety limit reached (${requestCountToday}/${DAILY_SAFETY_LIMIT}) — pausing until tomorrow`);
+    setTimeout(scheduleNextPoll, 60 * 60 * 1000); // check again in an hour, in case the day rolled over
+    return;
+  }
+  const wasLive = await checkForUpdates();
+  const nextDelay = wasLive ? LIVE_POLL_MS : QUIET_POLL_MS;
+  setTimeout(scheduleNextPoll, nextDelay);
+}
+
 app.listen(PORT, () => {
   console.log(`Sift backend running on port ${PORT}`);
-  checkForUpdates(); // run once immediately
-  setInterval(checkForUpdates, POLL_INTERVAL_MS); // then every 15 minutes forever
+  scheduleNextPoll(); // runs immediately, then reschedules itself based on live/quiet state and daily usage
 
   // Series data changes slowly, so don't spend a hit on every redeploy;
   // first check happens after 1 minute, then every 4 hours.
