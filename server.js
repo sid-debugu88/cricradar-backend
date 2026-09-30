@@ -139,6 +139,17 @@ function chaseText(match) {
 
 function isBigWin(status) { return /won by/i.test(status || ''); }
 
+// CricAPI's matchStarted/matchEnded flags aren't always reliable on their
+// own — a finished match can still come back with matchEnded left false.
+// The status text itself is the more trustworthy signal, so we check both:
+// a match reads as "ended" if either the flag says so, OR the status text
+// clearly describes a finished result (won by, drawn, tied, abandoned, no result).
+function isMatchOver(match) {
+  if (match.matchEnded) return true;
+  const status = match.status || '';
+  return /won by|match drawn|match tied|no result|abandoned|match abandoned/i.test(status);
+}
+
 // Returns { title, body, tag }. `kind` is one of: live, wicket, innings, result, upcoming, update
 function formatAlert(kind, match, extra) {
   const label = matchLabel(match);
@@ -376,14 +387,14 @@ async function checkForUpdates() {
     currentMatchesCache = relevant.map(m => ({
       id: m.id, name: m.name, status: m.status, venue: m.venue,
       date: m.date, dateTimeGMT: m.dateTimeGMT, matchType: m.matchType,
-      teams: m.teams, score: m.score || [], matchStarted: !!m.matchStarted, matchEnded: !!m.matchEnded,
+      teams: m.teams, score: m.score || [], matchStarted: !!m.matchStarted, matchEnded: isMatchOver(m),
     }));
 
     relevant.forEach(detectChanges);
     relevant.forEach(checkUpcomingReminder);
     lastSuccessfulPoll = new Date().toISOString();
 
-    const anyLive = relevant.some(m => m.matchStarted && !m.matchEnded);
+    const anyLive = relevant.some(m => m.matchStarted && !isMatchOver(m));
     if (relevant.length === 0) {
       console.log(`[poll] checked ${matches.length} matches, none involve watched teams right now`);
     }
