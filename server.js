@@ -262,14 +262,23 @@ function detectChanges(match) {
   };
 
   if (!prev) {
-    // First time we've seen this match — announce it started, don't spam history.
+    // First time we've seen this match since the backend last restarted.
+    // Don't assume it just went live — it may have already finished before
+    // we saw it (e.g. right after a redeploy), so check real state first.
     summary.wickets = totalWickets(match);
     summary.innings = (match.score || []).length;
     lastKnownState[id] = summary;
-    const f = formatAlert(match.matchStarted === false ? 'update' : 'live', match);
+
+    const alreadyOver = isMatchOver(match);
+    const notStartedYet = match.matchStarted === false && !alreadyOver;
+    const kind = alreadyOver ? 'result' : (notStartedYet ? 'update' : 'live');
+    const f = formatAlert(kind, match);
+    const tag = alreadyOver ? 'Result' : (notStartedYet ? 'Upcoming' : 'Match live');
+    const headline = alreadyOver
+      ? (match.name || 'Match')
+      : (notStartedYet ? (match.name || 'Match') : `${match.name || 'Match'} is live`);
     pushAlert({
-      tag: 'Match live',
-      headline: `${match.name || 'Match'} is live`,
+      tag, headline,
       sub: match.status || 'In progress',
       matchId: id,
       pushTitle: f.title, pushBody: f.body, pushHome: f.home, pushAway: f.away,
