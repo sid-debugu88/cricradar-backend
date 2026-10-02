@@ -341,25 +341,33 @@ function summariseScore(match) {
 // burning through the same daily request budget as the live-score poll.
 async function checkSeriesAndFixtures() {
   try {
-    const seriesUrl = `https://api.cricapi.com/v1/series?apikey=${CRICAPI_KEY}&offset=0`;
-    const res = await fetch(seriesUrl);
-    const data = await res.json();
-
-    if (data.status !== 'success') {
-      console.error('CricAPI series error:', data.status, data.reason || '');
+    trackCricApiRequest();
+    const page0 = await fetch(`https://api.cricapi.com/v1/series?apikey=${CRICAPI_KEY}&offset=0`).then(r => r.json());
+    if (page0.status !== 'success') {
+      console.error('CricAPI series error:', page0.status, page0.reason || '');
       return;
     }
+    let allSeries = page0.data || [];
 
-    const allSeries = data.data || [];
+    // CricAPI paginates ~25 per page. This runs only a few times a day
+    // (every 4 hours), so a second page costs very little against the daily
+    // budget and meaningfully widens what "upcoming" can show — a single
+    // page was quietly cutting off real series further down the list.
+    trackCricApiRequest();
+    const page1 = await fetch(`https://api.cricapi.com/v1/series?apikey=${CRICAPI_KEY}&offset=25`).then(r => r.json()).catch(() => null);
+    if (page1 && page1.status === 'success' && Array.isArray(page1.data)) {
+      allSeries = allSeries.concat(page1.data);
+    }
+
     // Keep only series that plausibly involve a team or competition we watch,
     // matched by name since the series list doesn't break out team names directly.
     activeSeries = allSeries.filter(s => {
       const name = (s.name || '').toLowerCase();
       return WATCHED_TEAMS.some(w => name.includes(w)) ||
              WATCHED_COMPETITIONS.some(c => name.includes(c));
-    }).slice(0, 8);
+    }).slice(0, 14); // a bit more headroom now that we're pulling two pages
 
-    console.log(`[series] tracked ${activeSeries.length} relevant series of ${allSeries.length} total`);
+    console.log(`[series] tracked ${activeSeries.length} relevant series of ${allSeries.length} total across 2 pages`);
   } catch (err) {
     console.error('[series] failed:', err.message);
   }
