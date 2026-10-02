@@ -69,7 +69,7 @@ const WATCHED_COMPETITIONS = [
   'big bash', 'bbl', 'the hundred', 'cpl', 'caribbean premier league',
   'sa20', 'women\'s premier league', 'wpl', 'women\'s big bash',
   'world cup', 't20 world cup', 'champions trophy', 'world test championship',
-  'the ashes', 'asia cup'
+  'the ashes', 'asia cup', 'asian games'
 ];
 
 // ---- STATE ----
@@ -198,7 +198,7 @@ function formatAlert(kind, match, extra) {
 
 function parseGMT(str) {
   if (!str) return null;
-  const withZ = /Z$\vert{}[+-]\d\d:?\d\d$/.test(str) ? str : str + 'Z';
+  const withZ = /Z$|[+-]\d\d:?\d\d$/.test(str) ? str : str + 'Z';
   const d = new Date(withZ);
   return isNaN(d.getTime()) ? null : d;
 }
@@ -241,25 +241,12 @@ async function sendPushToAll(alert) {
   subscriptions = stillValid;
 }
 
-// ---- SMART MATCHING LOGIC INJECTED HERE ----
 function involvesWatchedTeam(match) {
-  // Strips everything except letters and numbers so "India (Asian Games)" matches "india"
-  const normalize = (str) => String(str || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-
-  const teams = (match.teams || []).map(normalize);
-  const name = normalize(match.name);
-  const series = normalize(match.series_id) + normalize(match.matchType);
-
-  const byTeam = WATCHED_TEAMS.some(w => {
-    const userName = normalize(w);
-    return teams.some(t => t.includes(userName)) || name.includes(userName);
-  });
-
-  const byCompetition = WATCHED_COMPETITIONS.some(c => {
-    const compName = normalize(c);
-    return name.includes(compName) || series.includes(compName);
-  });
-
+  const teams = (match.teams || []).map(t => t.toLowerCase());
+  const name = (match.name || '').toLowerCase();
+  const series = (match.series_id || match.matchType || '').toString().toLowerCase();
+  const byTeam = WATCHED_TEAMS.some(w => teams.some(t => t.includes(w)));
+  const byCompetition = WATCHED_COMPETITIONS.some(c => name.includes(c) || series.includes(c));
   return byTeam || byCompetition;
 }
 
@@ -375,10 +362,9 @@ async function checkSeriesAndFixtures() {
     // Keep only series that plausibly involve a team or competition we watch,
     // matched by name since the series list doesn't break out team names directly.
     activeSeries = allSeries.filter(s => {
-      const normalize = (str) => String(str || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-      const name = normalize(s.name);
-      return WATCHED_TEAMS.some(w => name.includes(normalize(w))) ||
-             WATCHED_COMPETITIONS.some(c => name.includes(normalize(c)));
+      const name = (s.name || '').toLowerCase();
+      return WATCHED_TEAMS.some(w => name.includes(w)) ||
+             WATCHED_COMPETITIONS.some(c => name.includes(c));
     }).slice(0, 14); // a bit more headroom now that we're pulling two pages
 
     console.log(`[series] tracked ${activeSeries.length} relevant series of ${allSeries.length} total across 2 pages`);
