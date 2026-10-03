@@ -81,6 +81,7 @@ let alertFeed = [];      // the list your frontend will display
 let currentMatchesCache = []; // relevant matches from the latest poll, served to the frontend for free
 let lastSuccessfulPoll = null; // when we last actually heard back from CricAPI — shown to users honestly
 let activeSeries = [];   // ongoing/upcoming series we're tracking — fills "Series watch"
+let lookaheadFixtures = []; // real fixtures found via Highlightly's date-based search, up to a week out
 let upcomingFixtures = []; // scheduled matches not live yet — fills "no live match" gap
 
 // ---------- ALERT WORDING ----------
@@ -339,6 +340,63 @@ function summariseScore(match) {
 // Separate, slower poll — series schedules don't change minute to minute,
 // so checking every 4 hours keeps the "what's coming up" data fresh without
 // burning through the same daily request budget as the live-score poll.
+// CricAPI's currentMatches can't see more than roughly a day ahead — that's
+// exactly how we missed the Asian Games final. Highlightly's /matches
+// endpoint takes a specific date, so we can ask it directly: "what's on
+// this day?" for each of the next few days, and catch fixtures CricAPI
+// simply can't see yet. This runs on the same slow cadence as the series
+// check (every 4 hours) since fixture schedules don't change minute to
+// minute, and it's a genuinely different lookup than the live-score poll.
+async function checkLookaheadFixtures() {
+  if (!HIGHLIGHTLY_KEY || HIGHLIGHTLY_KEY === 'PUT_KEY_HERE_LOCALLY_ONLY') {
+    console.log('[lookahead] skipped — HIGHLIGHTLY_KEY not configured');
+    return;
+  }
+  const DAYS_AHEAD = 6; // a one-week lookahead window — enough to catch "the final is in 2 days" without burning the whole daily budget
+  const found = [];
+
+  for (let i = 0; i <= DAYS_AHEAD; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() + i);
+    const dateStr = d.toISOString().slice(0, 10);
+
+    try {
+      const res = await fetch(`${HIGHLIGHTLY_BASE}/matches?date=${dateStr}`, {
+        headers: { 'x-rapidapi-key': HIGHLIGHTLY_KEY }
+      });
+      const data = await res.json();
+      const matches = Array.isArray(data) ? data : (data.data || []);
+
+      matches.forEach(m => {
+        const home = (m.homeTeam && m.homeTeam.name) || '';
+        const away = (m.awayTeam && m.awayTeam.name) || '';
+        const matchesWatchedTeam = WATCHED_TEAMS.some(w =>
+          home.toLowerCase().includes(w) || away.toLowerCase().includes(w)
+        );
+        if (matchesWatchedTeam) {
+          found.push({
+            id: 'hl-' + m.id, name: m.name || `${home} vs ${away}`,
+            teams: [home, away], venue: m.location && m.location.name,
+            dateTimeGMT: m.startDate, matchType: m.type,
+            source: 'highlightly-lookahead',
+          });
+        }
+      });
+    } catch (err) {
+      console.error(`[lookahead] failed for ${dateStr}:`, err.message);
+      // one bad day shouldn't stop the rest of the week from being checked
+    }
+  }
+
+  lookaheadFixtures = found;
+  console.log(`[lookahead] found ${found.length} fixtures involving watched teams over the next ${DAYS_AHEAD} days`);
+
+  // Anything found this way that's starting within 24 hours should trigger
+  // the same "starts soon" alert as a CricAPI-discovered match would —
+  // this is the actual fix for missing the Asian Games final notification.
+  found.forEach(m => checkUpcomingReminder({ ...m, matchStarted: false }));
+}
+
 async function checkSeriesAndFixtures() {
   try {
     trackCricApiRequest();
@@ -476,6 +534,13 @@ app.get('/api/series', (req, res) => {
   res.json({ series: activeSeries });
 });
 
+// Real upcoming fixtures found via Highlightly's date-based lookup — this is
+// what catches tournaments like the Asian Games final that CricAPI's
+// near-term-only view can't see yet.
+app.get('/api/lookahead', (req, res) => {
+  res.json({ fixtures: lookaheadFixtures });
+});
+
 // Real detail for a specific match, fetched on demand when a user clicks a
 // card — we don't pre-fetch this for every match to stay inside the daily
 // request budget, only when someone actually wants to see more.
@@ -589,4 +654,9 @@ app.listen(PORT, () => {
   // first check happens after 1 minute, then every 4 hours.
   setTimeout(checkSeriesAndFixtures, 60 * 1000);
   setInterval(checkSeriesAndFixtures, SERIES_POLL_INTERVAL_MS);
+
+  // Staggered 30s after the series check so the two don't fire in the same
+  // instant on startup — same 4-hour cadence, since fixtures don't change fast.
+  setTimeout(checkLookaheadFixtures, 90 * 1000);
+  setInterval(checkLookaheadFixtures, SERIES_POLL_INTERVAL_MS);
 });
