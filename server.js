@@ -242,6 +242,24 @@ async function sendPushToAll(alert) {
   subscriptions = stillValid;
 }
 
+// Highlightly's team names for domestic clubs, A-teams, and youth sides can
+// contain a watched country's name as a substring — "India A", "India
+// Under-19s", sponsor-named club sides — and a loose substring check was
+// drowning the real internationals in noise. This requires the team name to
+// be the country name itself (allowing a trailing "Women" for women's
+// internationals, which we do want), nothing else attached.
+const EXCLUDE_SUFFIX_PATTERN = /\b(A|XI|Under-?\d+|U\d+|Emerging|Invitation|Academy)\b/i;
+function isSeniorInternationalTeam(name) {
+  const n = (name || '').trim();
+  if (!n) return false;
+  if (EXCLUDE_SUFFIX_PATTERN.test(n)) return false;
+  const nLower = n.toLowerCase().replace(/\s+women$/i, '').trim();
+  return WATCHED_TEAMS.includes(nLower);
+}
+function isSeniorInternationalMatch(home, away) {
+  return isSeniorInternationalTeam(home) || isSeniorInternationalTeam(away);
+}
+
 function involvesWatchedTeam(match) {
   const teams = (match.teams || []).map(t => t.toLowerCase());
   const name = (match.name || '').toLowerCase();
@@ -370,10 +388,7 @@ async function checkLookaheadFixtures() {
       matches.forEach(m => {
         const home = (m.homeTeam && m.homeTeam.name) || '';
         const away = (m.awayTeam && m.awayTeam.name) || '';
-        const matchesWatchedTeam = WATCHED_TEAMS.some(w =>
-          home.toLowerCase().includes(w) || away.toLowerCase().includes(w)
-        );
-        if (matchesWatchedTeam) {
+        if (isSeniorInternationalMatch(home, away)) {
           found.push({
             id: 'hl-' + m.id, name: m.name || `${home} vs ${away}`,
             teams: [home, away], venue: m.location && m.location.name,
@@ -388,7 +403,14 @@ async function checkLookaheadFixtures() {
     }
   }
 
-  lookaheadFixtures = found;
+  // The same fixture can legitimately appear on more than one day's query
+  // (e.g. a match spanning midnight), so dedupe by ID before storing.
+  const seen = {};
+  lookaheadFixtures = found.filter(m => {
+    if (seen[m.id]) return false;
+    seen[m.id] = true;
+    return true;
+  });
   console.log(`[lookahead] found ${found.length} fixtures involving watched teams over the next ${DAYS_AHEAD} days`);
 
   // Anything found this way that's starting within 24 hours should trigger
