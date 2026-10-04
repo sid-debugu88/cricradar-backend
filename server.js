@@ -50,10 +50,62 @@ if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   console.log('Push notifications: NOT configured — set VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY');
 }
 
-// Every device that's enabled alerts gets stored here so we can push to
-// them later. In-memory for the MVP — resets if the server restarts,
-// which is fine for testing but a real launch needs a database.
-let subscriptions = [];
+// ---- PERSISTENT STORAGE ----
+// Each subscriber's push credentials AND their chosen teams live here, in a
+// real SQLite file on disk — not server memory. Memory was fine when "losing
+// it on redeploy" only meant re-subscribing; once each person's team
+// preferences are what's stored, silently resetting everyone on every
+// deploy would be a real, confusing problem for actual users.
+//
+// IMPORTANT CAVEAT: on Railway's free tier, the filesystem itself can still
+// reset on redeploy unless a persistent volume is attached to this service.
+// This file survives normal server restarts (crashes, sleep/wake), but NOT
+// necessarily a fresh deploy, until a volume is set up. Check Railway's
+// "Volumes" tab for this service — attach one mounted at /data and update
+// DB_PATH below to /data/sift.db to make this fully durable.
+const Database = require('better-sqlite3');
+const DB_PATH = process.env.DB_PATH || './sift.db';
+const db = new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS subscribers (
+    endpoint TEXT PRIMARY KEY,
+    subscription_json TEXT NOT NULL,
+    teams_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )
+`);
+
+function dbGetAllSubscribers() {
+  return db.prepare('SELECT endpoint, subscription_json, teams_json FROM subscribers').all()
+    .map(row => ({
+      subscription: JSON.parse(row.subscription_json),
+      teams: JSON.parse(row.teams_json),
+    }));
+}
+function dbUpsertSubscriber(subscriptionObj, teams) {
+  const stmt = db.prepare(`
+    INSERT INTO subscribers (endpoint, subscription_json, teams_json, updated_at)
+    VALUES (@endpoint, @subJson, @teamsJson, datetime('now'))
+    ON CONFLICT(endpoint) DO UPDATE SET
+      subscription_json = @subJson,
+      teams_json = @teamsJson,
+      updated_at = datetime('now')
+  `);
+  stmt.run({
+    endpoint: subscriptionObj.endpoint,
+    subJson: JSON.stringify(subscriptionObj),
+    teamsJson: JSON.stringify(teams || []),
+  });
+}
+function dbRemoveSubscriber(endpoint) {
+  db.prepare('DELETE FROM subscribers WHERE endpoint = ?').run(endpoint);
+}
+function dbCountSubscribers() {
+  return db.prepare('SELECT COUNT(*) as c FROM subscribers').get().c;
+}
 
 // World cricket — international teams, major domestic leagues, and ICC events.
 // A match counts as relevant if it involves one of these teams OR belongs to
@@ -213,10 +265,23 @@ function pushAlert(alert) {
   sendPushToAll(alert);
 }
 
-// Actually deliver this alert to every subscribed device, even ones
-// with the site closed right now — this is the real "wake your phone up."
+// A subscriber with an empty teams list hasn't set a preference yet (or is
+// on an older version of the frontend that never sent one) — treat that as
+// "send me everything" rather than silently going quiet on them. Once they
+// do pick teams, they only get alerts for those.
+function subscriberWantsThis(subscriberTeams, alertTeamsLower) {
+  if (!subscriberTeams || subscriberTeams.length === 0) return true;
+  if (!alertTeamsLower || alertTeamsLower.length === 0) return true; // alert has no team info — send to everyone rather than silently drop it
+  return subscriberTeams.some(t => alertTeamsLower.includes(t));
+}
+
+// Actually deliver this alert, but only to subscribers who actually follow
+// one of the teams involved — this is the real per-user filtering, not a
+// global broadcast to everyone regardless of what they picked.
 async function sendPushToAll(alert) {
-  if (!VAPID_PUBLIC_KEY || subscriptions.length === 0) return;
+  if (!VAPID_PUBLIC_KEY) return;
+  const all = dbGetAllSubscribers();
+  if (all.length === 0) return;
 
   const payload = JSON.stringify({
     title: alert.pushTitle || alert.tag,
@@ -225,21 +290,27 @@ async function sendPushToAll(alert) {
     home: alert.pushHome, away: alert.pushAway,
   });
 
-  const stillValid = [];
-  for (const sub of subscriptions) {
+  const alertTeamsLower = [alert.pushHome, alert.pushAway]
+    .filter(Boolean)
+    .map(t => t.toLowerCase());
+
+  let sentCount = 0;
+  for (const { subscription, teams } of all) {
+    if (!subscriberWantsThis(teams, alertTeamsLower)) continue;
     try {
-      await webpush.sendNotification(sub, payload);
-      stillValid.push(sub);
+      await webpush.sendNotification(subscription, payload);
+      sentCount++;
     } catch (err) {
       // A 410/404 means the browser unsubscribed or the device is gone —
-      // drop it quietly instead of retrying forever.
-      if (err.statusCode !== 410 && err.statusCode !== 404) {
+      // remove them from storage instead of retrying forever.
+      if (err.statusCode === 410 || err.statusCode === 404) {
+        dbRemoveSubscriber(subscription.endpoint);
+      } else {
         console.error('[push] failed to one subscriber:', err.message);
-        stillValid.push(sub);
       }
     }
   }
-  subscriptions = stillValid;
+  console.log(`[push] sent to ${sentCount} of ${all.length} subscribers (filtered by team)`);
 }
 
 // Highlightly's team names for domestic clubs, A-teams, and youth sides can
@@ -540,7 +611,7 @@ app.get('/api/feed', (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({
     ok: true, lastPoll: new Date().toISOString(), matchesTracked: Object.keys(lastKnownState).length,
-    subscribers: subscriptions.length, seriesTracked: activeSeries.length,
+    subscribers: dbCountSubscribers(), seriesTracked: activeSeries.length,
     cricApiRequestsToday: requestCountToday, dailySafetyLimit: DAILY_SAFETY_LIMIT,
   });
 });
@@ -604,10 +675,14 @@ app.get('/api/push/test', async (req, res) => {
   if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
     return res.json({ ok: false, problem: 'VAPID keys are not loaded on the server' });
   }
-  if (subscriptions.length === 0) {
+  const allForTest = dbGetAllSubscribers();
+  if (allForTest.length === 0) {
     return res.json({ ok: false, problem: 'No devices subscribed on the backend (subscribers = 0)' });
   }
 
+  // This test endpoint intentionally ignores each subscriber's team filter —
+  // it's for confirming delivery and wording on YOUR device, not simulating
+  // real per-user targeting.
   // ?kind=wicket|live|result|upcoming|innings sends a realistic sample of that
   // alert so you can judge the wording and look without waiting for a real match.
   const sample = {
@@ -624,12 +699,12 @@ app.get('/api/push/test', async (req, res) => {
   const payload = JSON.stringify({ title: f.title, body: f.body, matchId: 'sample-' + kind, home: f.home, away: f.away });
 
   const results = [];
-  for (const sub of subscriptions) {
+  for (const { subscription } of allForTest) {
     try {
-      await webpush.sendNotification(sub, payload);
-      results.push({ endpoint: sub.endpoint.slice(0, 60) + '...', sent: true });
+      await webpush.sendNotification(subscription, payload);
+      results.push({ endpoint: subscription.endpoint.slice(0, 60) + '...', sent: true });
     } catch (err) {
-      results.push({ endpoint: sub.endpoint.slice(0, 60) + '...', sent: false, statusCode: err.statusCode, error: err.body || err.message });
+      results.push({ endpoint: subscription.endpoint.slice(0, 60) + '...', sent: false, statusCode: err.statusCode, error: err.body || err.message });
     }
   }
   res.json({ ok: true, kind, preview: f, results });
@@ -642,12 +717,18 @@ app.get('/api/push/public-key', (req, res) => {
 
 // The frontend calls this once the browser grants permission, handing us
 // the subscription object we'll use to actually push to that device.
+// Accepts either the raw push subscription (old frontend, no team filter —
+// falls back to "send everything") or { subscription, teams: [...] } from
+// an updated frontend that's telling us which teams this device follows.
 app.post('/api/push/subscribe', (req, res) => {
-  const sub = req.body;
+  const body = req.body;
+  const sub = body && body.subscription ? body.subscription : body;
+  const teams = (body && Array.isArray(body.teams)) ? body.teams.map(t => String(t).toLowerCase()) : [];
+
   if (!sub || !sub.endpoint) return res.status(400).json({ ok: false, error: 'Invalid subscription' });
-  const exists = subscriptions.some(s => s.endpoint === sub.endpoint);
-  if (!exists) subscriptions.push(sub);
-  res.json({ ok: true, subscribers: subscriptions.length });
+
+  dbUpsertSubscriber(sub, teams);
+  res.json({ ok: true, subscribers: dbCountSubscribers() });
 });
 
 // ---- START ----
