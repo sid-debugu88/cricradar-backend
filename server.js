@@ -57,54 +57,88 @@ if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
 // preferences are what's stored, silently resetting everyone on every
 // deploy would be a real, confusing problem for actual users.
 //
-// IMPORTANT CAVEAT: on Railway's free tier, the filesystem itself can still
-// reset on redeploy unless a persistent volume is attached to this service.
-// This file survives normal server restarts (crashes, sleep/wake), but NOT
-// necessarily a fresh deploy, until a volume is set up. Check Railway's
-// "Volumes" tab for this service — attach one mounted at /data and update
-// DB_PATH below to /data/sift.db to make this fully durable.
-const Database = require('better-sqlite3');
+// Using sql.js instead of better-sqlite3: sql.js is pure WebAssembly/JS with
+// no native compile step, so it can't fail to build on Railway the way
+// better-sqlite3 did (that broke the live site — native modules need to be
+// compiled for the exact OS/architecture they run on, and Railway's default
+// build environment doesn't reliably have the tools for that).
+//
+// Tradeoff: sql.js keeps the database in memory and has no automatic disk
+// persistence, so every write here explicitly saves the whole database to a
+// file afterward, and startup explicitly loads that file if it exists.
+//
+// IMPORTANT CAVEAT (same as before): on Railway's free tier, the filesystem
+// itself can still reset on a fresh redeploy unless a persistent volume is
+// attached to this service — this file survives normal restarts, but not
+// necessarily a deploy, until a volume is set up. Check Railway's "Volumes"
+// tab for this service, attach one mounted at /data, and set DB_PATH to
+// /data/sift.db to make this fully durable across deploys too.
+const initSqlJs = require('sql.js');
+const fs = require('fs');
 const DB_PATH = process.env.DB_PATH || './sift.db';
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS subscribers (
-    endpoint TEXT PRIMARY KEY,
-    subscription_json TEXT NOT NULL,
-    teams_json TEXT NOT NULL DEFAULT '[]',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-  )
-`);
+let db = null; // set once initDb() resolves — everything that touches it runs after startup awaits this
+
+async function initDb() {
+  const SQL = await initSqlJs();
+  if (fs.existsSync(DB_PATH)) {
+    const fileBuffer = fs.readFileSync(DB_PATH);
+    db = new SQL.Database(fileBuffer);
+  } else {
+    db = new SQL.Database();
+  }
+  db.run(`
+    CREATE TABLE IF NOT EXISTS subscribers (
+      endpoint TEXT PRIMARY KEY,
+      subscription_json TEXT NOT NULL,
+      teams_json TEXT NOT NULL DEFAULT '[]',
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  persistDb();
+  console.log(`[db] ready — ${dbCountSubscribers()} subscriber(s) loaded from ${DB_PATH}`);
+}
+
+function persistDb() {
+  try {
+    const data = db.export();
+    fs.writeFileSync(DB_PATH, Buffer.from(data));
+  } catch (err) {
+    console.error('[db] failed to persist to disk:', err.message);
+  }
+}
 
 function dbGetAllSubscribers() {
-  return db.prepare('SELECT endpoint, subscription_json, teams_json FROM subscribers').all()
-    .map(row => ({
-      subscription: JSON.parse(row.subscription_json),
-      teams: JSON.parse(row.teams_json),
-    }));
+  if (!db) return [];
+  const result = db.exec('SELECT endpoint, subscription_json, teams_json FROM subscribers');
+  if (!result.length) return [];
+  return result[0].values.map(row => ({
+    subscription: JSON.parse(row[1]),
+    teams: JSON.parse(row[2]),
+  }));
 }
 function dbUpsertSubscriber(subscriptionObj, teams) {
-  const stmt = db.prepare(`
-    INSERT INTO subscribers (endpoint, subscription_json, teams_json, updated_at)
-    VALUES (@endpoint, @subJson, @teamsJson, datetime('now'))
-    ON CONFLICT(endpoint) DO UPDATE SET
-      subscription_json = @subJson,
-      teams_json = @teamsJson,
-      updated_at = datetime('now')
-  `);
-  stmt.run({
-    endpoint: subscriptionObj.endpoint,
-    subJson: JSON.stringify(subscriptionObj),
-    teamsJson: JSON.stringify(teams || []),
-  });
+  if (!db) return;
+  db.run(
+    `INSERT INTO subscribers (endpoint, subscription_json, teams_json, updated_at)
+     VALUES (?, ?, ?, datetime('now'))
+     ON CONFLICT(endpoint) DO UPDATE SET
+       subscription_json = excluded.subscription_json,
+       teams_json = excluded.teams_json,
+       updated_at = datetime('now')`,
+    [subscriptionObj.endpoint, JSON.stringify(subscriptionObj), JSON.stringify(teams || [])]
+  );
+  persistDb();
 }
 function dbRemoveSubscriber(endpoint) {
-  db.prepare('DELETE FROM subscribers WHERE endpoint = ?').run(endpoint);
+  if (!db) return;
+  db.run('DELETE FROM subscribers WHERE endpoint = ?', [endpoint]);
+  persistDb();
 }
 function dbCountSubscribers() {
-  return db.prepare('SELECT COUNT(*) as c FROM subscribers').get().c;
+  if (!db) return 0;
+  const result = db.exec('SELECT COUNT(*) as c FROM subscribers');
+  return result.length ? result[0].values[0][0] : 0;
 }
 
 // World cricket — international teams, major domestic leagues, and ICC events.
@@ -749,17 +783,27 @@ async function scheduleNextPoll() {
   setTimeout(scheduleNextPoll, nextDelay);
 }
 
-app.listen(PORT, () => {
-  console.log(`Sift backend running on port ${PORT}`);
-  scheduleNextPoll(); // runs immediately, then reschedules itself based on live/quiet state and daily usage
+// The database must finish loading before the server starts accepting
+// requests — otherwise a request could hit a route that reads `db` while
+// it's still null. If this fails, the server won't start at all, which is
+// much easier to diagnose from the logs than a silently broken "Offline"
+// site.
+initDb().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Sift backend running on port ${PORT}`);
+    scheduleNextPoll(); // runs immediately, then reschedules itself based on live/quiet state and daily usage
 
-  // Series data changes slowly, so don't spend a hit on every redeploy;
-  // first check happens after 1 minute, then every 4 hours.
-  setTimeout(checkSeriesAndFixtures, 60 * 1000);
-  setInterval(checkSeriesAndFixtures, SERIES_POLL_INTERVAL_MS);
+    // Series data changes slowly, so don't spend a hit on every redeploy;
+    // first check happens after 1 minute, then every 4 hours.
+    setTimeout(checkSeriesAndFixtures, 60 * 1000);
+    setInterval(checkSeriesAndFixtures, SERIES_POLL_INTERVAL_MS);
 
-  // Staggered 30s after the series check so the two don't fire in the same
-  // instant on startup — same 4-hour cadence, since fixtures don't change fast.
-  setTimeout(checkLookaheadFixtures, 90 * 1000);
-  setInterval(checkLookaheadFixtures, SERIES_POLL_INTERVAL_MS);
+    // Staggered 30s after the series check so the two don't fire in the same
+    // instant on startup — same 4-hour cadence, since fixtures don't change fast.
+    setTimeout(checkLookaheadFixtures, 90 * 1000);
+    setInterval(checkLookaheadFixtures, SERIES_POLL_INTERVAL_MS);
+  });
+}).catch(err => {
+  console.error('[FATAL] Database failed to initialize, server will not start:', err.message);
+  process.exit(1);
 });
