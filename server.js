@@ -57,6 +57,7 @@ if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
 // preferences are what's stored, silently resetting everyone on every
 // deploy would be a real, confusing problem for actual users.
 //
+// [redeploy trigger — confirming the sql.js switch is actually live]
 // Using sql.js instead of better-sqlite3: sql.js is pure WebAssembly/JS with
 // no native compile step, so it can't fail to build on Railway the way
 // better-sqlite3 did (that broke the live site — native modules need to be
